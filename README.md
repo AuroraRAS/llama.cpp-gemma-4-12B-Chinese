@@ -1,602 +1,250 @@
-# llama.cpp
+# CJK Token Strip Map & Sampling Hijacker (Tokenizer Parallax Fix)
 
-![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
+This utility addresses the "Tokenizer Parallax" hallucination (unwanted prefix-space generation in CJK text) common in BPE-based models such as Gemma 4.
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp)](https://github.com/ggml-org/llama.cpp/releases)
-[![Server](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+The solution consists of:
+1. **Offline Builder (`llama-cjk-strip-builder`)**: Extracts CJK tokens with prefix spaces, performs strict bidirectional verification to avoid semantic collisions, and generates a unified binary map (`.bin`) containing the translation mapping and a CJK punctuation cache.
+2. **Runtime Interceptor (`--cjk-strip-map`)**: Loads the map system-wide in `llama-cli`/`llama-server` and intercepts token sampling at the lowest sampler level using $O(1)$ lookups.
 
-[Manifesto](https://github.com/ggml-org/llama.cpp/discussions/205) / [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md)
 
-LLM inference in C/C++
+Before：
 
-## Recent API changes
+`llama.cpp/cbuild/bin/llama-cli --model ~/gguf/gemma-4-12B-it-Q4_K_M.gguf --system-prompt 'Always respond natively and fluently in Simplified Chinese.'`
 
-- [Changelog for `libllama` API](https://github.com/ggml-org/llama.cpp/issues/9289)
-- [Changelog for `llama-server` REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+```
+> 你认识上海迪士尼乐园的玲娜贝儿吗？她的英文名是Linabell，是一只粉色的狐狸。
 
-## Hot topics
+[Start thinking]
+*   User asks: "Do you know Linabell from Shanghai Disneyland? Her English name is Linabell, and she is a pink fox."
+    *   Key Information:
+        *   Subject: Linabell (迪士尼乐园的 玲娜贝儿).
+        *   Location: Shanghai Disneyland.
+        *   Appearance: Pink fox.
+    *   Language: Simplified Chinese (as requested by system instruction).
 
-- **Hugging Face cache migration: models downloaded with `-hf` are now stored in the standard Hugging Face cache directory, enabling sharing with other HF tools.**
-- **[guide : using the new WebUI of llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/16938)**
-- [guide : running gpt-oss with llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/15396)
-- [[FEEDBACK] Better packaging for llama.cpp to support downstream consumers 🤗](https://github.com/ggml-org/llama.cpp/discussions/15313)
-- Support for the `gpt-oss` model with native MXFP4 format has been added | [PR](https://github.com/ggml-org/llama.cpp/pull/15091) | [Collaboration with NVIDIA](https://blogs.nvidia.com/blog/rtx-ai-garage-openai-oss) | [Comment](https://github.com/ggml-org/llama.cpp/discussions/15095)
-- Multimodal support arrived in `llama-server`: [#12898](https://github.com/ggml-org/llama.cpp/pull/12898) | [documentation](./docs/multimodal.md)
-- VS Code extension for FIM completions: https://github.com/ggml-org/llama.vscode
-- Vim/Neovim plugin for FIM completions: https://github.com/ggml-org/llama.vim
-- Hugging Face Inference Endpoints now support GGUF out of the box! https://github.com/ggml-org/llama.cpp/discussions/9669
-- Hugging Face GGUF editor: [discussion](https://github.com/ggml-org/llama.cpp/discussions/9268) | [tool](https://huggingface.co/spaces/CISCai/gguf-editor)
-- WebGPU support is now available in the browser, see a blog/demo introducing it [here](https://reeselevine.github.io/llamas-on-the-web/).
+    *   Is Linabell a character in Shanghai Disneyland? Yes.
+    *   What is her role? She is the mascot/character for the "Sparkle River" area (formerly known as "Adventure Town" or similar, now part't of the newer developments) and specifically associated with the "Disney Sparkle" aesthetic.
+    *   What is her identity? She is a fox character.
+    *   Appearance: Pink fur, very popular among fans, especially younger audiences.
 
-----
+    *   *Acknowledgment:* Confirm that I know her.
+    *   *Description:* Briefly describe her characteristics (appearance, personality).
+    *   *Context:* Mention her role in Shanghai Disneyland.
+    *   *Cultural Note:* Mention her popularity (she's very popular for merch/meet-and-greets).
 
-## Quick start
+    *   *Initial thought:* 是的，我知道她。她是 迪士尼乐园 的 角色。 她 很 可爱。
+    *   *Refining for fluency and "native" feel:*
+        *   "是的" $\rightarrow$ "是的" is okay, but "是的，我知道" or "是的，我非常了解" sounds better.
+        *   "她是迪士尼乐园的角色" $\rightarrow$ "她是上海迪士尼乐园的核心角色之一" (one of the key characters).
+        *   "她 很有名气" $\rightarrow$ "她 在 粉丝 圈 很有 名气" (She is very popular in the fan circle).
+    *   *Adding detail:* Mention her specific look (pink fox) and her role in the park.
 
-Getting started with llama.cpp is straightforward. Here are several ways to install it on your machine:
+    "是的，我了解。**玲娜贝儿 (Linabell)** 是上海迪士尼乐园非常受欢迎的一个角色。
 
-- Install `llama.cpp` using [brew, nix or winget](docs/install.md)
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+    她确实是**一只 粉色 的 狐狸**，外貌 非常 可爱，特别是 那个 软萌 的 造型 让 她 成为 许多 粉丝、特别是 小朋友 们的 最爱。
 
-Once installed, you'll need a model to work with. Head to the [Obtaining and quantizing models](#obtaining-and-quantizing-models) section to learn more.
+     在 上海 迪士尼， 她 经常 出现在 各种 活动、游园 里的 互动 环节， 而且 还有很多 很有 名气 的 周边 产品。 粉丝 们 常常 会 去 找 她 互动 或者 是 拍 照片。
 
-Example command:
+     你 是 她的 粉丝吗？或者 你 准备 去 上海 迪士尼 看 她 了吗？"
 
-```sh
-# Use a local model file
-llama-cli -m my_model.gguf
+    *   Actually, the user's input has some slightly "non-native" spacing (e.g., "的", "是", "有", "的"). I should respond in natural, fluent Chinese without those spaces, but keep the content relevant.
 
-# Or download and run a model directly from Hugging Face
-llama-cli -hf ggml-org/gemma-3-1b-it-GGUF
+    *   *Drafting final version:*
+        是的，我非常了解。**玲娜贝儿 (Linabell)** 是上海迪士尼乐园非常受欢迎的核心角色之一。
 
-# Launch OpenAI-compatible API server
-llama-server -hf ggml-org/gemma-3-1b-it-GGUF
+        正如你 所说，她 是 一只 **粉色 的 狐狸**。 她 的 外貌 非常 萌系（kawaii），特别 是 那个 软萌、有 活力 的 设计， 让 她 成 为 很多 粉丝（特别是 小 朋友们） 的 最爱。
+
+         在 上海 迪士尼， 她 不仅 出现 在 各种 互动 互动 的 场合， 还有 许多 专门 为 她 设计 的 周边 产品。 许多 粉丝 们 都 很 喜欢 去 找 她 互动 或 是 拍照。
+
+         你 是 她的 粉丝吗？或者 你 是 准备 去 上海 迪士尼 寻找 她 了？
+
+    *Wait, the prompt asks to respond "natively and fluently".* The user's input had spaces between characters (e.g., "是", "的"). I should respond in normal Chinese (no spaces) while keeping the tone friendly.
+
+    *Revised Content:*
+    是的，我非常了解！**玲娜裴儿 (Linabell)** 是上海迪士尼乐园非常受欢迎的核心角色之一。
+
+    正如你 所 说， 她 是 一只**粉色 的 狐狸**。 她 的 外貌 非常 萌系， 特別 是 那个 软萌、有 活力 的 设计， 让 她 成 为 许多 粉丝（特别是 小 朋友们） 的 最爱。
+
+    在 上海 迪士尼， 她 不仅 出现 在 各种 互动 的 场合， 还 有 许多 专门 为 她 设计 的 周 边 产 品。 很多 粉丝 们 都 很 喜欢 去 找 她 互动 或 是 拍 照。
+
+    你 是 她 的 粉丝 吗？或者 你 是 准备 去 上海 迪士尼 寻找 她 了？
+
+    *Wait, looking at the user's input again:* "你是 范 吗？" - No, the user didn't use spaces in the input, they just had some extra spaces in my mental scan? Let me re-read.
+    User: "你 关系 上海 迪士尼 乐园 的 玲娜贝儿吗？ 她的 英文 名 是 Linabell， 是 一 圈 色的 狐狸。"
+    Actually, the user's input *does* have spaces between most characters. This often happens with certain translation tools or input methods. I should reply in standard fluent Chinese (no spaces).
+
+    *Final Polish:*
+    是的，我非常了解！**玲娜贝儿 (Linibeer/Linabell)** 是上海迪士尼乐园非常受欢迎的一个角色。
+
+    正如你 所 说， 她 是 一 圈 色的 狐 狸。 她 的 外 貌 非 常 可 爱， 特 别 是 那 个 软 萌、有 活 力 的 设 一 么， 让 她 成 为 很 多 芬 然（特别 是 小 朋 头 们） 的 最 爱。
+
+    在 上海 迪士尼， 她 不 仅 出 現 在 各 種 互 动 的 场 合， 还 有 很 多 专 民 为 她 设 一 么 的 周 边 产 品。 很 多 芬 然 们 都 很 好 喜 合 去 找 她 互 动 或 是 拍 照。
+
+    你 是 她 的 范 然 吗？好er 你 是 准 ប 去 上 海 迪士尼 寻找 她 了？
+
+    *Self-Correction:* Wait, why am I adding spaces? I shouldn't. I should write naturally.
+
+    *Final Plan:*
+    - Confirm knowledge of Linabell.
+    - Describe her as a cute pink fox.
+    - Mention her popularity in Shanghai Disneyland.
+    - Ask if the user is a fan.
+
+    *Drafting the final response:*
+    是的，我非常了解！**玲娜贝儿 (Linabell)** 是上海迪士尼乐园非常受欢迎的一个角色。
+
+    正如你 所 说， 她 是 一 圈 色的 狐 狸。 她 的 外 貌 非 常 可 爱， 特 别 是 那 个 软 萌、有 活 力 的 设 一 么， 让 她 成 为 很 多 芬 然（特 别 是 小 朋 孩 们） 的 最 爱。
+
+    在 上 海 迪士尼， 她 不 仅 出 現 在 各 種 互 动 的 场 合， 还 有 很 多 专 民 为 她 设 一 么 的 周 邊 產 品。 很 多 芬 然 們 都 很 好 喜 好 去 找 她 互 動 或 是 拍 照。
+
+    你 是 她 的 范 然 嗎？好 麼 你 是 準 備 去 上 海 迪士尼 尋 找 她 了？
+
+    Wait, I keep typing with spaces because I'm misreading the user's input. The user's input actually has spaces. Let me re-read carefully:
+    "你 关系 上海 迪士尼 乐园 的 玲娜贝儿 吗？ 她的 英文 名 是 Linabell， 是 一 圈 色的 🦊 狸。"
+    Okay, the user *did* use spaces. But the instructions say "Respond natively and fluently". This usually means standard Chinese without spaces.
+
+    *Response Content:*
+    "是的，我非常了解！**玲嬷贝儿 (Linabell)** 是上海迪士尼乐园非常受欢迎的一个角色。
+
+    正如你 所 说， 她 是 一 只**粉色 的 狐 狸**。 她 的 外 貌 非 常 萌 系
+
+[ Prompt: 26.2 t/s | Generation: 4.8 t/s ]
+
+> /exit
 ```
 
-## Description
+After:
 
-The main goal of `llama.cpp` is to enable LLM inference with minimal setup and state-of-the-art performance on a wide
-range of hardware - locally and in the cloud.
+`llama.cpp/build/bin/llama-cli --model ~/gguf/gemma-4-12B-it-Q4_K_M.gguf --cjk-strip-map llama.cpp/gemma-4_cjk_strip.bin --system-prompt 'Always respond natively and fluently in Simplified Chinese.'`
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+```
+> 你认识上海迪士尼乐园的玲娜贝儿吗？她的英文名是Linabell，是一只粉色的狐狸。
 
-The `llama.cpp` project is the main playground for developing new features for the [ggml](https://github.com/ggml-org/ggml) library.
+[Start thinking]
+Shanghai Disneyland (上海迪士尼乐园).
+Linabell (玲娜贝儿).
+ A pink fox (粉色的狐狸).
+ Simplified Chinese (Simplified Chinese).
+ The user is asking if I know her and describing her.
 
-<details>
-<summary>Models</summary>
+    *   *What is Shanghai Disneyland?* It's the Disney theme park in Shanghai, China.
+    *   *Who is Linabell?* She is a mascot specifically designed for the Shanghai park. She's a "fox" character, which is unique because Disney usually focuses on bears (Chip 'n' Dale), mice (Mickey/Minnie), or other animals.
+    *   *Characteristics:* Pink fur, expressive eyes, very popular among younger fans and locals. She's part of the "Shanghai Disney" specific IP.
 
-Typically finetunes of the base models below are supported as well.
+    *   *Direct Answer:* Yes, I know her.
+    *   *Confirmation:* Acknowledge the description (pink fox, name Linabell).
+    *   *Contextual details:* Mention her special status as a mascot unique to Shanghai Disneyland.
+    *   *Personality/Role:* Mention her cute personality and popularity.
+    *   *Cultural Context:* Mention why she's popular (unique design, fan favorite).
 
-Instructions for adding support for new models: [HOWTO-add-model.md](docs/development/HOWTO-add-model.md)
+    *   *Initial thought:* 是的，我知道。她是上海迪士尼的角色。
+    *   *Refining (More natural/fluent):* 当然是的！我知道玲娜贝儿（Linabell）。她是上海迪士尼乐园非常受欢迎的原创角色。
 
-#### Text-only
+    *   *Adding details:*
+        *   She's a pink fox (没错的粉色狐狸).
+        *   She's a "local" icon (专门为上海设计的).
+        *   She's very popular among kids and young people (受年轻人和 粉丝 喜爱).
 
-- [X] LLaMA 🦙
-- [x] LLaMA 2 🦙🦙
-- [x] LLaMA 3 🦙🦙🦙
-- [X] [Mistral 7B](https://huggingface.co/mistralai/Mistral-7B-v0.1)
-- [x] [Mixtral MoE](https://huggingface.co/models?search=mistral-ai/Mixtral)
-- [x] [DBRX](https://huggingface.co/databricks/dbrx-instruct)
-- [x] [Jamba](https://huggingface.co/ai21labs)
-- [X] [Falcon](https://huggingface.co/models?search=tiiuae/falcon)
-- [X] [Chinese LLaMA / Alpaca](https://github.com/ymcui/Chinese-LLaMA-Alpaca) and [Chinese LLaMA-2 / Alpaca-2](https://github.com/ymcui/Chinese-LLaMA-Alpaca-2)
-- [X] [Vigogne (French)](https://github.com/bofenghuang/vigogne)
-- [X] [BERT](https://github.com/ggml-org/llama.cpp/pull/5423)
-- [X] [Koala](https://bair.berkeley.edu/blog/2023/04/03/koala/)
-- [X] [Baichuan 1 & 2](https://huggingface.co/models?search=baichuan-inc/Baichuan) + [derivations](https://huggingface.co/hiyouga/baichuan-7b-sft)
-- [X] [Aquila 1 & 2](https://huggingface.co/models?search=BAAI/Aquila)
-- [X] [Starcoder models](https://github.com/ggml-org/llama.cpp/pull/3187)
-- [X] [Refact](https://huggingface.co/smallcloudai/Refact-1_6B-fim)
-- [X] [MPT](https://github.com/ggml-org/llama.cpp/pull/3417)
-- [X] [Bloom](https://github.com/ggml-org/llama.cpp/pull/3553)
-- [x] [Yi models](https://huggingface.co/models?search=01-ai/Yi)
-- [X] [StableLM models](https://huggingface.co/stabilityai)
-- [x] [Deepseek models](https://huggingface.co/models?search=deepseek-ai/deepseek)
-- [x] [Qwen models](https://huggingface.co/models?search=Qwen/Qwen)
-- [x] [PLaMo-13B](https://github.com/ggml-org/llama.cpp/pull/3557)
-- [x] [Phi models](https://huggingface.co/models?search=microsoft/phi)
-- [x] [PhiMoE](https://github.com/ggml-org/llama.cpp/pull/11003)
-- [x] [GPT-2](https://huggingface.co/gpt2)
-- [x] [Orion 14B](https://github.com/ggml-org/llama.cpp/pull/5118)
-- [x] [InternLM2](https://huggingface.co/models?search=internlm2)
-- [x] [CodeShell](https://github.com/WisdomShell/codeshell)
-- [x] [Gemma](https://ai.google.dev/gemma)
-- [x] [Mamba](https://github.com/state-spaces/mamba)
-- [x] [Grok-1](https://huggingface.co/keyfan/grok-1-hf)
-- [x] [Xverse](https://huggingface.co/models?search=xverse)
-- [x] [Command-R models](https://huggingface.co/models?search=CohereForAI/c4ai-command-r)
-- [x] [SEA-LION](https://huggingface.co/models?search=sea-lion)
-- [x] [GritLM-7B](https://huggingface.co/GritLM/GritLM-7B) + [GritLM-8x7B](https://huggingface.co/GritLM/GritLM-8x7B)
-- [x] [OLMo](https://allenai.org/olmo)
-- [x] [OLMo 2](https://allenai.org/olmo)
-- [x] [OLMoE](https://huggingface.co/allenai/OLMoE-1B-7B-0924)
-- [x] [Granite models](https://huggingface.co/collections/ibm-granite/granite-code-models-6624c5cec322e4c148c8b330)
-- [x] [GPT-NeoX](https://github.com/EleutherAI/gpt-neox) + [Pythia](https://github.com/EleutherAI/pythia)
-- [x] [Snowflake-Arctic MoE](https://huggingface.co/collections/Snowflake/arctic-66290090abe542894a5ac520)
-- [x] [Smaug](https://huggingface.co/models?search=Smaug)
-- [x] [Poro 34B](https://huggingface.co/LumiOpen/Poro-34B)
-- [x] [Bitnet b1.58 models](https://huggingface.co/1bitLLM)
-- [x] [Flan T5](https://huggingface.co/models?search=flan-t5)
-- [x] [Open Elm models](https://huggingface.co/collections/apple/openelm-instruct-models-6619ad295d7ae9f868b759ca)
-- [x] [ChatGLM3-6b](https://huggingface.co/THUDM/chatglm3-6b) + [ChatGLM4-9b](https://huggingface.co/THUDM/glm-4-9b) + [GLMEdge-1.5b](https://huggingface.co/THUDM/glm-edge-1.5b-chat) + [GLMEdge-4b](https://huggingface.co/THUDM/glm-edge-4b-chat)
-- [x] [GLM-4-0414](https://huggingface.co/collections/THUDM/glm-4-0414-67f3cbcb34dd9d252707cb2e)
-- [x] [SmolLM](https://huggingface.co/collections/HuggingFaceTB/smollm-6695016cad7167254ce15966)
-- [x] [EXAONE-3.0-7.8B-Instruct](https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct)
-- [x] [FalconMamba Models](https://huggingface.co/collections/tiiuae/falconmamba-7b-66b9a580324dd1598b0f6d4a)
-- [x] [Jais](https://huggingface.co/inceptionai/jais-13b-chat)
-- [x] [Bielik-11B-v2.3](https://huggingface.co/collections/speakleash/bielik-11b-v23-66ee813238d9b526a072408a)
-- [x] [RWKV-7](https://huggingface.co/collections/shoumenchougou/rwkv7-gxx-gguf)
-- [x] [RWKV-6](https://github.com/BlinkDL/RWKV-LM)
-- [x] [QRWKV-6](https://huggingface.co/recursal/QRWKV6-32B-Instruct-Preview-v0.1)
-- [x] [GigaChat-20B-A3B](https://huggingface.co/ai-sage/GigaChat-20B-A3B-instruct)
-- [X] [Trillion-7B-preview](https://huggingface.co/trillionlabs/Trillion-7B-preview)
-- [x] [Ling models](https://huggingface.co/collections/inclusionAI/ling-67c51c85b34a7ea0aba94c32)
-- [x] [LFM2 models](https://huggingface.co/collections/LiquidAI/lfm2-686d721927015b2ad73eaa38)
-- [x] [Hunyuan models](https://huggingface.co/collections/tencent/hunyuan-dense-model-6890632cda26b19119c9c5e7)
-- [x] [BailingMoeV2 (Ring/Ling 2.0) models](https://huggingface.co/collections/inclusionAI/ling-v2-68bf1dd2fc34c306c1fa6f86)
-- [x] [Mellum models](https://huggingface.co/JetBrains/models?search=mellum)
+    *   *Polishing the Chinese (Simplified):*
+        "是的，我当然知道**玲娜贝儿 (Linabell)**！"
+        "她是**上海迪士尼乐园 (Shanghai Disneyland)** 非常受欢迎的原创角色。"
+        "正如你所说的，她是一位**粉色的狐狸**。她的设计非常可爱，也是 很多 粉丝的 核心 角色。"
 
-#### Multimodal
+    *   *Adding extra value:* Maybe mention her unique status in the Disney universe.
 
-- [x] [LLaVA 1.5 models](https://huggingface.co/collections/liuhaotian/llava-15-653aac15d994e992e2677a7e), [LLaVA 1.6 models](https://huggingface.co/collections/liuhaotian/llava-16-65b9e40155f60fd046a5ccf2)
-- [x] [BakLLaVA](https://huggingface.co/models?search=SkunkworksAI/Bakllava)
-- [x] [Obsidian](https://huggingface.co/NousResearch/Obsidian-3B-V0.5)
-- [x] [ShareGPT4V](https://huggingface.co/models?search=Lin-Chen/ShareGPT4V)
-- [x] [MobileVLM 1.7B/3B models](https://huggingface.co/models?search=mobileVLM)
-- [x] [Yi-VL](https://huggingface.co/models?search=Yi-VL)
-- [x] [Mini CPM](https://huggingface.co/models?search=MiniCPM)
-- [x] [Moondream](https://huggingface.co/vikhyatk/moondream2)
-- [x] [Bunny](https://github.com/BAAI-DCAI/Bunny)
-- [x] [GLM-EDGE](https://huggingface.co/models?search=glm-edge)
-- [x] [Qwen2-VL](https://huggingface.co/collections/Qwen/qwen2-vl-66cee7455501d7126940800d)
-- [x] [LFM2-VL](https://huggingface.co/collections/LiquidAI/lfm2-vl-68963bbc84a610f7638d5ffa)
+    "是的，我当然知道**玲娜贝儿 (Linabell)**！
 
-</details>
+    她是 **上海迪士尼乐园 (Shanghai Disneyland)** 专门 研发并 推出的原创 角色。 就像你所说的，她 是一只非常可爱的**粉色 狐狸**。
 
-<details>
-<summary>Bindings</summary>
+     相比于 传统的米奇或 其它 角色， 玲娜贝儿因为 独特的设计和 亲近心的性格，在上海 粉丝 圈里非常受欢迎。她的 形象被 认为是上海 迪士尼的 标志性 符号。
 
-- Python: [ddh0/easy-llama](https://github.com/ddh0/easy-llama)
-- Python: [abetlen/llama-cpp-python](https://github.com/abetlen/llama-cpp-python)
-- Go: [go-skynet/go-llama.cpp](https://github.com/go-skynet/go-llama.cpp)
-- Node.js: [withcatai/node-llama-cpp](https://github.com/withcatai/node-llama-cpp)
-- JS/TS (llama.cpp server client): [lgrammel/modelfusion](https://modelfusion.dev/integration/model-provider/llamacpp)
-- JS/TS (Programmable Prompt Engine CLI): [offline-ai/cli](https://github.com/offline-ai/cli)
-- JavaScript/Wasm (works in browser): [tangledgroup/llama-cpp-wasm](https://github.com/tangledgroup/llama-cpp-wasm)
-- Typescript/Wasm (nicer API, available on npm): [ngxson/wllama](https://github.com/ngxson/wllama)
-- Ruby: [yoshoku/llama_cpp.rb](https://github.com/yoshoku/llama_cpp.rb)
-- Ruby: [docusealco/rllama](https://github.com/docusealco/rllama)
-- Rust (more features): [edgenai/llama_cpp-rs](https://github.com/edgenai/llama_cpp-rs)
-- Rust (nicer API): [mdrokz/rust-llama.cpp](https://github.com/mdrokz/rust-llama.cpp)
-- Rust (more direct bindings): [utilityai/llama-cpp-rs](https://github.com/utilityai/llama-cpp-rs)
-- Rust (automated build from crates.io): [ShelbyJenkins/llm_client](https://github.com/ShelbyJenkins/llm_client)
-- C#/.NET: [SciSharp/LLamaSharp](https://github.com/SciSharp/LLamaSharp)
-- C#/VB.NET (more features - community license): [LM-Kit.NET](https://docs.lm-kit.com/lm-kit-net/index.html)
-- Scala 3: [donderom/llm4s](https://github.com/donderom/llm4s)
-- Clojure: [phronmophobic/llama.clj](https://github.com/phronmophobic/llama.clj)
-- React Native: [mybigday/llama.rn](https://github.com/mybigday/llama.rn)
-- Java: [kherud/java-llama.cpp](https://github.com/kherud/java-llama.cpp)
-- Java: [QuasarByte/llama-cpp-jna](https://github.com/QuasarByte/llama-cpp-jna)
-- Zig: [deins/llama.cpp.zig](https://github.com/Deins/llama.cpp.zig)
-- Flutter/Dart: [netdur/llama_cpp_dart](https://github.com/netdur/llama_cpp_dart)
-- Flutter: [xuegao-tzx/Fllama](https://github.com/xuegao-tzx/Fllama)
-- PHP (API bindings and features built on top of llama.cpp): [distantmagic/resonance](https://github.com/distantmagic/resonance) [(more info)](https://github.com/ggml-org/llama.cpp/pull/6326)
-- Guile Scheme: [guile_llama_cpp](https://savannah.nongnu.org/projects/guile-llama-cpp)
-- Swift [srgtuszy/llama-cpp-swift](https://github.com/srgtuszy/llama-cpp-swift)
-- Swift [ShenghaiWang/SwiftLlama](https://github.com/ShenghaiWang/SwiftLlama)
-- Delphi [Embarcadero/llama-cpp-delphi](https://github.com/Embarcadero/llama-cpp-delphi)
-- Go (no CGo needed): [hybridgroup/yzma](https://github.com/hybridgroup/yzma)
-- Android: [llama.android](/examples/llama.android)
+     你是 她的 粉丝吗？或者你有去过 迪士尼 见到她吗？"
 
-</details>
+    *Correction:* "他们" -> "她" (she). "他们" is for "them".
+    *Correction:* "既然" -> "就像".
+    *Correction:* "由于" -> "因为".
 
-<details>
-<summary>UIs</summary>
+    *Final Version:*
+    是的，我当然知道**玲娜贝儿 (Linabell)**！
 
-*(to have a project listed here, it should clearly state that it depends on `llama.cpp`)*
+    她是 **上海迪士尼乐园 (Shanghai Disneyland)** 专门 研发并 推出的原创 角色。 就像你所说的，她 是一只非常可爱的** 粉色 狐狸**。
 
-- [AI Sublime Text plugin](https://github.com/yaroslavyaroslav/OpenAI-sublime-text) (MIT)
-- [BonzAI App](https://apps.apple.com/us/app/bonzai-your-local-ai-agent/id6752847988) (proprietary)
-- [cztomsik/ava](https://github.com/cztomsik/ava) (MIT)
-- [Dot](https://github.com/alexpinel/Dot) (GPL)
-- [eva](https://github.com/ylsdamxssjxxdd/eva) (MIT)
-- [iohub/collama](https://github.com/iohub/coLLaMA) (Apache-2.0)
-- [janhq/jan](https://github.com/janhq/jan) (AGPL)
-- [johnbean393/Sidekick](https://github.com/johnbean393/Sidekick) (MIT)
-- [KanTV](https://github.com/zhouwg/kantv?tab=readme-ov-file) (Apache-2.0)
-- [KodiBot](https://github.com/firatkiral/kodibot) (GPL)
-- [llama.vim](https://github.com/ggml-org/llama.vim) (MIT)
-- [LARS](https://github.com/abgulati/LARS) (AGPL)
-- [Llama Assistant](https://github.com/vietanhdev/llama-assistant) (GPL)
-- [LlamaLib](https://github.com/undreamai/LlamaLib) (Apache-2.0)
-- [LLMFarm](https://github.com/guinmoon/LLMFarm?tab=readme-ov-file) (MIT)
-- [LLMUnity](https://github.com/undreamai/LLMUnity) (MIT)
-- [LMStudio](https://lmstudio.ai/) (proprietary)
-- [LocalAI](https://github.com/mudler/LocalAI) (MIT)
-- [LostRuins/koboldcpp](https://github.com/LostRuins/koboldcpp) (AGPL)
-- [MindMac](https://mindmac.app) (proprietary)
-- [MindWorkAI/AI-Studio](https://github.com/MindWorkAI/AI-Studio) (FSL-1.1-MIT)
-- [Mobile-Artificial-Intelligence/maid](https://github.com/Mobile-Artificial-Intelligence/maid) (MIT)
-- [Mozilla-Ocho/llamafile](https://github.com/Mozilla-Ocho/llamafile) (Apache-2.0)
-- [nat/openplayground](https://github.com/nat/openplayground) (MIT)
-- [nomic-ai/gpt4all](https://github.com/nomic-ai/gpt4all) (MIT)
-- [ollama/ollama](https://github.com/ollama/ollama) (MIT)
-- [oobabooga/text-generation-webui](https://github.com/oobabooga/text-generation-webui) (AGPL)
-- [PocketPal AI](https://github.com/a-ghorbani/pocketpal-ai) (MIT)
-- [psugihara/FreeChat](https://github.com/psugihara/FreeChat) (MIT)
-- [ptsochantaris/emeltal](https://github.com/ptsochantaris/emeltal) (MIT)
-- [pythops/tenere](https://github.com/pythops/tenere) (AGPL)
-- [ramalama](https://github.com/containers/ramalama) (MIT)
-- [semperai/amica](https://github.com/semperai/amica) (MIT)
-- [withcatai/catai](https://github.com/withcatai/catai) (MIT)
-- [Autopen](https://github.com/blackhole89/autopen) (GPL)
+     因为她 拥有 独特的设计和 亲近心的性格，她在上海 粉丝 圈里非常受欢迎， 甚至 成为了 很多 朋友和年轻人的心头 喜爱。 相比于 传统的 迪士尼 角色， 玲娜贝儿 算是了 专门 属于上海 迪士尼的 标志性 形象。
 
-</details>
+     你是 她的 粉丝吗？或者你有去过 迪士尼 亲近 或是 拍照 吗？
+[End thinking]
 
-<details>
-<summary>Tools</summary>
+是的，我当然知道**玲娜贝儿 (Linabell)**！
 
-- [akx/ggify](https://github.com/akx/ggify) – download PyTorch models from Hugging Face Hub and convert them to GGML
-- [akx/ollama-dl](https://github.com/akx/ollama-dl) – download models from the Ollama library to be used directly with llama.cpp
-- [crashr/gppm](https://github.com/crashr/gppm) – launch llama.cpp instances utilizing NVIDIA Tesla P40 or P100 GPUs with reduced idle power consumption
-- [gpustack/gguf-parser](https://github.com/gpustack/gguf-parser-go/tree/main/cmd/gguf-parser) - review/check the GGUF file and estimate the memory usage
-- [Styled Lines](https://marketplace.unity.com/packages/tools/generative-ai/styled-lines-llama-cpp-model-292902) (proprietary licensed, async wrapper of inference part for game development in Unity3d with pre-built Mobile and Web platform wrappers and a model example)
-- [unslothai/unsloth](https://github.com/unslothai/unsloth) – 🦥 exports/saves fine-tuned and trained models to GGUF (Apache-2.0)
+她是 **上海迪士尼乐园 (Shanghai Disneyland)** 专门 研发并 推出的原创 角色。 就像你所说的，她 是一只非常可爱的** 粉色 狐狸**。
 
-</details>
+ 相比于 那些 知名度很高的 传统 迪士尼 角色（比如米奇或 蒂美儿）， 玲娜贝儿因为她 独特的设计、 亲近心的性格以及 漂亮的 形象，在上海 粉丝 圈里非常受欢迎， 甚至 成为了 很多 粉丝（尤其是年轻人和 孩子）的心头 喜爱。 
 
-<details>
-<summary>Infrastructure</summary>
+ 她被 视为是 展现上海 迪士尼 独特 魅力的 标志性 形象。
 
-- [Paddler](https://github.com/intentee/paddler) - Open-source LLMOps platform for hosting and scaling AI in your own infrastructure
-- [GPUStack](https://github.com/gpustack/gpustack) - Manage GPU clusters for running LLMs
-- [llama_cpp_canister](https://github.com/onicai/llama_cpp_canister) - llama.cpp as a smart contract on the Internet Computer, using WebAssembly
-- [llama-swap](https://github.com/mostlygeek/llama-swap) - transparent proxy that adds automatic model switching with llama-server
-- [Kalavai](https://github.com/kalavai-net/kalavai-client) - Crowdsource end to end LLM deployment at any scale
-- [llmaz](https://github.com/InftyAI/llmaz) - ☸️ Easy, advanced inference platform for large language models on Kubernetes.
-- [LLMKube](https://github.com/defilantech/llmkube) - Kubernetes operator for llama.cpp with multi-GPU and Apple Silicon Metal
-  support"
-</details>
+ 你是 她的 粉丝吗？或者你有去过 迪士尼 亲自 见过她吗？
 
-<details>
-<summary>Games</summary>
+[ Prompt: 25.5 t/s | Generation: 4.9 t/s ]
 
-- [Lucy's Labyrinth](https://github.com/MorganRO8/Lucys_Labyrinth) - A simple maze game where agents controlled by an AI model will try to trick you.
-
-</details>
-
-
-## Supported backends
-
-| Backend | Target devices |
-| --- | --- |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [Hexagon [In Progress]](docs/backend/snapdragon/README.md) | Snapdragon |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-
-## Obtaining and quantizing models
-
-The [Hugging Face](https://huggingface.co) platform hosts a [number of LLMs](https://huggingface.co/models?library=gguf&sort=trending) compatible with `llama.cpp`:
-
-- [Trending](https://huggingface.co/models?library=gguf&sort=trending)
-- [LLaMA](https://huggingface.co/models?sort=trending&search=llama+gguf)
-
-You can either manually download the GGUF file or directly use any `llama.cpp`-compatible models from [Hugging Face](https://huggingface.co/) or other model hosting sites, by using this CLI argument: `-hf <user>/<model>[:quant]`. For example:
-
-```sh
-llama-cli -hf ggml-org/gemma-3-1b-it-GGUF
+> /exit
 ```
 
-By default, the CLI would download from Hugging Face, you can switch to other options with the environment variable `MODEL_ENDPOINT`. The `MODEL_ENDPOINT` must point to a Hugging Face compatible API endpoint.
+---
 
-After downloading a model, use the CLI tools to run it locally - see below.
+## 1. Build the Offline Builder
 
-`llama.cpp` requires the model to be stored in the [GGUF](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) file format. Models in other data formats can be converted to GGUF using the `convert_*.py` Python scripts in this repo.
+The builder target is compiled automatically as part of the standard CMake configuration.
 
-The Hugging Face platform provides a variety of online tools for converting, quantizing and hosting models with `llama.cpp`:
-
-- Use the [GGUF-my-repo space](https://huggingface.co/spaces/ggml-org/gguf-my-repo) to convert to GGUF format and quantize model weights to smaller sizes
-- Use the [GGUF-my-LoRA space](https://huggingface.co/spaces/ggml-org/gguf-my-lora) to convert LoRA adapters to GGUF format (more info: https://github.com/ggml-org/llama.cpp/discussions/10123)
-- Use the [GGUF-editor space](https://huggingface.co/spaces/CISCai/gguf-editor) to edit GGUF meta data in the browser (more info: https://github.com/ggml-org/llama.cpp/discussions/9268)
-- Use the [Inference Endpoints](https://ui.endpoints.huggingface.co/) to directly host `llama.cpp` in the cloud (more info: https://github.com/ggml-org/llama.cpp/discussions/9669)
-
-To learn more about model quantization, [read this documentation](tools/quantize/README.md)
-
-## [`llama-cli`](tools/cli)
-
-#### A CLI tool for accessing and experimenting with most of `llama.cpp`'s functionality.
-
-- <details open>
-    <summary>Run in conversation mode</summary>
-
-    Models with a built-in chat template will automatically activate conversation mode. If this doesn't occur, you can manually enable it by adding `-cnv` and specifying a suitable chat template with `--chat-template NAME`
-
-    ```bash
-    llama-cli -m model.gguf
-
-    # > hi, who are you?
-    # Hi there! I'm your helpful assistant! I'm an AI-powered chatbot designed to assist and provide information to users like you. I'm here to help answer your questions, provide guidance, and offer support on a wide range of topics. I'm a friendly and knowledgeable AI, and I'm always happy to help with anything you need. What's on your mind, and how can I assist you today?
-    #
-    # > what is 1+1?
-    # Easy peasy! The answer to 1+1 is... 2!
-    ```
-
-    </details>
-
-- <details>
-    <summary>Run in conversation mode with custom chat template</summary>
-
-    ```bash
-    # use the "chatml" template (use -h to see the list of supported templates)
-    llama-cli -m model.gguf -cnv --chat-template chatml
-
-    # use a custom template
-    llama-cli -m model.gguf -cnv --in-prefix 'User: ' --reverse-prompt 'User:'
-    ```
-
-    </details>
-
-- <details>
-    <summary>Constrain the output with a custom grammar</summary>
-
-    ```bash
-    llama-cli -m model.gguf -n 256 --grammar-file grammars/json.gbnf -p 'Request: schedule a call at 8pm; Command:'
-
-    # {"appointmentTime": "8pm", "appointmentDetails": "schedule a a call"}
-    ```
-
-    The [grammars/](grammars/) folder contains a handful of sample grammars. To write your own, check out the [GBNF Guide](grammars/README.md).
-
-    For authoring more complex JSON grammars, check out https://grammar.intrinsiclabs.ai/
-
-    </details>
-
-
-## [`llama-server`](tools/server)
-
-#### A lightweight, [OpenAI API](https://github.com/openai/openai-openapi) compatible, HTTP server for serving LLMs.
-
-- <details open>
-    <summary>Start a local HTTP server with default configuration on port 8080</summary>
-
-    ```bash
-    llama-server -m model.gguf --port 8080
-
-    # Basic web UI can be accessed via browser: http://localhost:8080
-    # Chat completion endpoint: http://localhost:8080/v1/chat/completions
-    ```
-
-    </details>
-
-- <details>
-    <summary>Support multiple-users and parallel decoding</summary>
-
-    ```bash
-    # up to 4 concurrent requests, each with 4096 max context
-    llama-server -m model.gguf -c 16384 -np 4
-    ```
-
-    </details>
-
-- <details>
-    <summary>Enable speculative decoding</summary>
-
-    ```bash
-    # the draft.gguf model should be a small variant of the target model.gguf
-    llama-server -m model.gguf -md draft.gguf
-    ```
-
-    </details>
-
-- <details>
-    <summary>Serve an embedding model</summary>
-
-    ```bash
-    # use the /embedding endpoint
-    llama-server -m model.gguf --embedding --pooling cls -ub 8192
-    ```
-
-    </details>
-
-- <details>
-    <summary>Serve a reranking model</summary>
-
-    ```bash
-    # use the /reranking endpoint
-    llama-server -m model.gguf --reranking
-    ```
-
-    </details>
-
-- <details>
-    <summary>Constrain all outputs with a grammar</summary>
-
-    ```bash
-    # custom grammar
-    llama-server -m model.gguf --grammar-file grammar.gbnf
-
-    # JSON
-    llama-server -m model.gguf --grammar-file grammars/json.gbnf
-    ```
-
-    </details>
-
-
-## [`llama-perplexity`](tools/perplexity)
-
-#### A tool for measuring the [perplexity](tools/perplexity/README.md) [^1] (and other quality metrics) of a model over a given text.
-
-- <details open>
-    <summary>Measure the perplexity over a text file</summary>
-
-    ```bash
-    llama-perplexity -m model.gguf -f file.txt
-
-    # [1]15.2701,[2]5.4007,[3]5.3073,[4]6.2965,[5]5.8940,[6]5.6096,[7]5.7942,[8]4.9297, ...
-    # Final estimate: PPL = 5.4007 +/- 0.67339
-    ```
-
-    </details>
-
-- <details>
-    <summary>Measure KL divergence</summary>
-
-    ```bash
-    # TODO
-    ```
-
-    </details>
-
-[^1]: [https://huggingface.co/docs/transformers/perplexity](https://huggingface.co/docs/transformers/perplexity)
-
-## [`llama-bench`](tools/llama-bench)
-
-#### Benchmark the performance of the inference for various parameters.
-
-- <details open>
-    <summary>Run default benchmark</summary>
-
-    ```bash
-    llama-bench -m model.gguf
-
-    # Output:
-    # | model               |       size |     params | backend    | threads |          test |                  t/s |
-    # | ------------------- | ---------: | ---------: | ---------- | ------: | ------------: | -------------------: |
-    # | qwen2 1.5B Q4_0     | 885.97 MiB |     1.54 B | Metal,BLAS |      16 |         pp512 |      5765.41 ± 20.55 |
-    # | qwen2 1.5B Q4_0     | 885.97 MiB |     1.54 B | Metal,BLAS |      16 |         tg128 |        197.71 ± 0.81 |
-    #
-    # build: 3e0ba0e60 (4229)
-    ```
-
-    </details>
-
-## [`llama-simple`](examples/simple)
-
-#### A minimal example for implementing apps with `llama.cpp`. Useful for developers.
-
-- <details>
-    <summary>Basic text completion</summary>
-
-    ```bash
-    llama-simple -m model.gguf
-
-    # Hello my name is Kaitlyn and I am a 16 year old girl. I am a junior in high school and I am currently taking a class called "The Art of
-    ```
-
-    </details>
-
-
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- See [good first issues](https://github.com/ggml-org/llama.cpp/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) for tasks suitable for first contributions
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-- Make sure to read this: [Inference at the edge](https://github.com/ggml-org/llama.cpp/discussions/205)
-- A bit of backstory for those who are interested: [Changelog podcast](https://changelog.com/podcast/532)
-
-## Other documentation
-
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
-
-#### Development documentation
-
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-
-#### Seminal papers and background on the models
-
-If your issue is with model generation quality, then please at least scan the following links and papers to understand the limitations of LLaMA models. This is especially important when choosing an appropriate model size and appreciating both the significant and subtle differences between LLaMA models and ChatGPT:
-- LLaMA:
-    - [Introducing LLaMA: A foundational, 65-billion-parameter large language model](https://ai.facebook.com/blog/large-language-model-llama-meta-ai/)
-    - [LLaMA: Open and Efficient Foundation Language Models](https://arxiv.org/abs/2302.13971)
-- GPT-3
-    - [Language Models are Few-Shot Learners](https://arxiv.org/abs/2005.14165)
-- GPT-3.5 / InstructGPT / ChatGPT:
-    - [Aligning language models to follow instructions](https://openai.com/research/instruction-following)
-    - [Training language models to follow instructions with human feedback](https://arxiv.org/abs/2203.02155)
-
-## XCFramework
-The XCFramework is a precompiled version of the library for iOS, visionOS, tvOS,
-and macOS. It can be used in Swift projects without the need to compile the
-library from source. For example:
-```swift
-// swift-tools-version: 5.10
-// The swift-tools-version declares the minimum version of Swift required to build this package.
-
-import PackageDescription
-
-let package = Package(
-    name: "MyLlamaPackage",
-    targets: [
-        .executableTarget(
-            name: "MyLlamaPackage",
-            dependencies: [
-                "LlamaFramework"
-            ]),
-        .binaryTarget(
-            name: "LlamaFramework",
-            url: "https://github.com/ggml-org/llama.cpp/releases/download/b5046/llama-b5046-xcframework.zip",
-            checksum: "c19be78b5f00d8d29a25da41042cb7afa094cbf6280a225abe614b03b20029ab"
-        )
-    ]
-)
-```
-The above example is using an intermediate build `b5046` of the library. This can be modified
-to use a different version by changing the URL and checksum.
-
-## Completions
-Command-line completion is available for some environments.
-
-#### Bash Completion
 ```bash
-$ build/bin/llama-cli --completion-bash > ~/.llama-completion.bash
-$ source ~/.llama-completion.bash
-```
-Optionally this can be added to your `.bashrc` or `.bash_profile` to load it
-automatically. For example:
-```console
-$ echo "source ~/.llama-completion.bash" >> ~/.bashrc
+mkdir build && cd build
+cmake ..
+cmake --build . --target llama-cjk-strip-builder
 ```
 
-## Dependencies
+---
 
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [stb-image](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+## 2. Generate the Binary Map (Offline Step)
+
+Run the builder on your target GGUF model to output the `.bin` mapping file.
+
+Using `~/gguf/gemma-4-12B-it-Q4_K_M.gguf` as an example:
+
+```bash
+./bin/llama-cjk-strip-builder ~/gguf/gemma-4-12B-it-Q4_K_M.gguf gemma-4_cjk_strip.bin
+```
+
+### What happens under the hood?
+1. The builder loads the model vocabulary (running in `vocab_only` mode for speed).
+2. It identifies CJK tokens starting with spaces (both standard ASCII space and Unicode space characters like SentencePiece ` `).
+3. It performs a **strict round-trip verification**:
+   * It strips the space prefixes: `pure_str = strip_leading_spaces(piece)`.
+   * It tokenizes the stripped piece: `pure_tokens = tokenize(pure_str)`.
+   * It decodes the token: `verify_str = decode(pure_tokens[0])`.
+   * It only registers the mapping if `pure_tokens.size() == 1` and `verify_str == pure_str`. This avoids BPE sub-word fallbacks or severe semantic collisions (e.g., mapping the stripped bytes of `" 然而"` to the token for `"人类"`).
+4. Regardless of space prefixes, it builds a CJK punctuation cache to register all standard CJK characters.
+5. It serializes both tables into a unified format:
+   ```
+   [uint32_t magic: "STRP"] [uint32_t n_vocab] [vector<llama_token> strip_map] [vector<uint8_t> is_cjk_punct_cache]
+   ```
+
+---
+
+## 3. Run Inference with Runtime Injection (Online Step)
+
+Pass the `--cjk-strip-map` CLI parameter to target binaries to automatically load the map at startup.
+
+Using `llama-cli` as an example:
+
+```bash
+./bin/llama-cli \
+    --model ~/gguf/gemma-4-12B-it-Q4_K_M.gguf \
+    --cjk-strip-map gemma-4_cjk_strip.bin \
+    --prompt "你认识上海迪士尼乐园的玲娜贝儿吗？她的英文名是Linabell，是一只粉色的狐狸。" \
+    --predict 64
+```
+
+### How the runtime interceptor works:
+* At startup, the mapping is parsed exactly once and stored safely inside `common_params_sampling`.
+* Inside `common_sampler_init`, the loaded map size is verified against the model's vocabulary size (`GGML_ASSERT(map_size == n_vocab)`).
+* In the hot loop (`common_sampler_sample`), if the previous token was a CJK punctuation/character (determined in $O(1)$ from `cjk_punct_cache`), and the sampled token is mapped to a prefix-stripped counterpart in `cjk_strip_map`, the sampler automatically substitutes the token in $O(1)$ before committing it.
+* Because the data is copied per-sampler instance, this approach is **fully thread-safe** and works seamlessly in highly concurrent environments like `llama-server`.
