@@ -1925,6 +1925,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_sampling().set_env("LLAMA_ARG_BACKEND_SAMPLING"));
     add_opt(common_arg(
+        {"--cjk-strip-map"}, "FNAME",
+        "path to CJK strip map binary file",
+        [](common_params & params, const std::string & value) {
+            std::ifstream file(value, std::ios::binary);
+            if (!file) {
+                throw std::runtime_error("error: failed to open CJK strip map file: " + value);
+            }
+            uint32_t magic;
+            file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+            if (magic != 0x53545250) {
+                throw std::runtime_error("error: invalid magic in CJK strip map file (expected 0x53545250, got " + std::to_string(magic) + ")");
+            }
+            uint32_t n_vocab;
+            file.read(reinterpret_cast<char*>(&n_vocab), sizeof(n_vocab));
+            if (!file) {
+                throw std::runtime_error("error: failed to read CJK strip map vocab size");
+            }
+            params.sampling.cjk_strip_map.resize(n_vocab);
+            file.read(reinterpret_cast<char*>(params.sampling.cjk_strip_map.data()), n_vocab * sizeof(llama_token));
+            if (!file) {
+                throw std::runtime_error("error: failed to read CJK strip map content");
+            }
+            params.sampling.cjk_punct_cache.resize(n_vocab);
+            file.read(reinterpret_cast<char*>(params.sampling.cjk_punct_cache.data()), n_vocab * sizeof(uint8_t));
+            if (!file) {
+                throw std::runtime_error("error: failed to read CJK punct cache content");
+            }
+        }
+    ).set_sampling());
+    add_opt(common_arg(
         {"--pooling"}, "{none,mean,cls,last,rank}",
         "pooling type for embeddings, use model default if unspecified",
         [](common_params & params, const std::string & value) {

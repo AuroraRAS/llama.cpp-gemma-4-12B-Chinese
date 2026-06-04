@@ -186,6 +186,12 @@ std::string common_params_sampling::print() const {
 
 struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
+    GGML_ASSERT(vocab != nullptr);
+
+    if (!params.cjk_strip_map.empty()) {
+        GGML_ASSERT(params.cjk_strip_map.size() == (size_t)llama_vocab_n_tokens(vocab) && "cjk_strip_map size does not match vocab size");
+        GGML_ASSERT(params.cjk_punct_cache.size() == (size_t)llama_vocab_n_tokens(vocab) && "cjk_punct_cache size does not match vocab size");
+    }
 
     llama_sampler_chain_params lparams = llama_sampler_chain_default_params();
 
@@ -582,39 +588,46 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     id = cur_p.data[cur_p.selected].id;
 
-    if (grammar_first || !grammar_should_apply(gsmpl)) {
-        return id;
-    }
+    if (!grammar_first && grammar_should_apply(gsmpl)) {
+        // check if it the sampled token fits the grammar (grammar-based rejection sampling)
+        bool is_valid = false;
+        {
+            llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
+            llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
 
-    // check if it the sampled token fits the grammar (grammar-based rejection sampling)
-    {
-        llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
-        llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
+            llama_sampler_apply(grmr, &single_token_data_array);
 
-        llama_sampler_apply(grmr, &single_token_data_array);
+            is_valid = single_token_data_array.data[0].logit != -INFINITY;
+        }
 
-        const bool is_valid = single_token_data_array.data[0].logit != -INFINITY;
-        if (is_valid) {
-            return id;
+        if (!is_valid) {
+            // resampling:
+            // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
+            gsmpl->set_logits(ctx, idx);
+
+            llama_sampler_apply(rbudget,  &cur_p);
+
+            if (grammar_should_apply(gsmpl)) {
+                llama_sampler_apply(grmr,  &cur_p);
+            }
+
+            llama_sampler_apply(chain, &cur_p);
+
+            GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+
+            id = cur_p.data[cur_p.selected].id;
         }
     }
 
-    // resampling:
-    // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
-    gsmpl->set_logits(ctx, idx);
-
-    llama_sampler_apply(rbudget,  &cur_p);
-
-    if (grammar_should_apply(gsmpl)) {
-        llama_sampler_apply(grmr,  &cur_p);
+    // O(1) Token Hijacking (CJK Parallax Fix)
+    if (!gsmpl->params.cjk_strip_map.empty() && !gsmpl->prev.empty()) {
+        llama_token last_token = gsmpl->prev.rat(0);
+        if (last_token >= 0 && last_token < (llama_token)gsmpl->params.cjk_punct_cache.size() && gsmpl->params.cjk_punct_cache[last_token]) {
+            if (id >= 0 && id < (llama_token)gsmpl->params.cjk_strip_map.size() && gsmpl->params.cjk_strip_map[id] != -1) {
+                id = gsmpl->params.cjk_strip_map[id];
+            }
+        }
     }
-
-    llama_sampler_apply(chain, &cur_p);
-
-    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
-
-    id = cur_p.data[cur_p.selected].id;
-
     return id;
 }
 

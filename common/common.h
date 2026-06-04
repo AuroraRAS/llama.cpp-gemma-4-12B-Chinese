@@ -281,6 +281,9 @@ struct common_params_sampling {
 
     bool backend_sampling = false;
 
+    std::vector<llama_token> cjk_strip_map;
+    std::vector<uint8_t>     cjk_punct_cache;
+
     bool has_logit_bias() const {
         return !logit_bias.empty();
     }
