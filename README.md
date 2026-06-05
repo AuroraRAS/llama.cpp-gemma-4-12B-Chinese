@@ -5,6 +5,7 @@ This utility addresses the "Tokenizer Parallax" hallucination (unwanted prefix-s
 The solution consists of:
 1. **Offline Builder (`llama-cjk-strip-builder`)**: Extracts CJK tokens with prefix spaces, performs strict bidirectional verification to avoid semantic collisions, and generates a unified binary map (`.bin`) containing the translation mapping and a CJK punctuation cache.
 2. **Runtime Interceptor (`--cjk-strip-map`)**: Loads the map system-wide in `llama-cli`/`llama-server` and intercepts token sampling at the lowest sampler level using $O(1)$ lookups.
+3. **Heuristic Self-Speculative Rollback**: Handles isolated "pure space" tokens at the application layer (e.g. `llama-completion`) using a sliding window. Upon detecting a `[CJK Punct] -> [Space] -> [CJK]` sequence, it mathematically rolls back the KV cache (`n_past -= 2`), re-decodes the rescued CJK character directly, erases the hallucinated space from the terminal using dynamic UTF-8 column width backspacing (`\b \b`), rewinds the sampler Markov chain (`common_sampler_pop`), and syncs all display/output buffers.
 
 
 Before：
@@ -243,8 +244,38 @@ Using `llama-cli` as an example:
     --predict 64
 ```
 
+Alternatively, running the interactive conversation mode via `llama-completion`:
+
+```bash
+./bin/llama-completion \
+    --model ~/gguf/gemma-4-12B-it-Q4_K_M.gguf \
+    --cjk-strip-map gemma-4_cjk_strip.bin \
+    --prompt "你认识上海迪士尼乐园的玲娜贝儿吗？它的英文名是Linabell，是一只粉色的狐狸。" \
+    --system-prompt "Always respond natively and fluently in Simplified Chinese." \
+    --jinja \
+    --predict 400
+```
+
 ### How the runtime interceptor works:
 * At startup, the mapping is parsed exactly once and stored safely inside `common_params_sampling`.
 * Inside `common_sampler_init`, the loaded map size is verified against the model's vocabulary size (`GGML_ASSERT(map_size == n_vocab)`).
 * In the hot loop (`common_sampler_sample`), if the previous token was a CJK punctuation/character (determined in $O(1)$ from `cjk_punct_cache`), and the sampled token is mapped to a prefix-stripped counterpart in `cjk_strip_map`, the sampler automatically substitutes the token in $O(1)$ before committing it.
 * Because the data is copied per-sampler instance, this approach is **fully thread-safe** and works seamlessly in highly concurrent environments like `llama-server`.
+
+---
+
+## 4. Heuristic Self-Speculative Rollback
+
+To handle isolated "pure space" tokens without forcibly truncating the model's expected probability manifold with `-INFINITY` logit rejection (which causes syntactic collapse), the system employs a sliding-window speculative rollback at the application layer (`llama-completion`):
+
+* **Sliding Window Tracking**: Maintains a 3-token history `[Token A, Token B, Token C]` during generation.
+* **Pattern Detection**: Matches when `Token A` (CJK punct), `Token B` (Space), and `Token C` (CJK character) are generated consecutively.
+* **KV Cache & Decoder Rollback**:
+  - Removes `Token B` and `Token C` from the KV cache using `llama_memory_seq_rm(mem, 0, n_past - 2, -1)`.
+  - Rewinds `n_past -= 2` and re-decodes `Token C` (rescued CJK character) at the correct position.
+* **Console & Buffer Synchronization**:
+  - Dynamically calculates the UTF-8 visual column widths of the space and CJK character.
+  - Backspaces exactly `space_width + cjk_width` columns from the terminal to erase the space and Token C, then reprints Token C.
+  - Removes Token B and Token C from local buffers (`output_tokens`, `output_ss`, `assistant_ss`) and appends rescued Token C.
+* **Sampler State Rewind**: Calls `common_sampler_pop(smpl, 2)` to pop 2 tokens from the sampler's internal Markov chain and accepts rescued Token C.
+

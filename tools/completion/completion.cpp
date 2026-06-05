@@ -5,6 +5,7 @@
 #include "sampling.h"
 #include "llama.h"
 #include "chat.h"
+#include "unicode.h"
 
 #include <clocale>
 #include <cstdio>
@@ -61,6 +62,43 @@ static bool file_is_empty(const std::string & path) {
     f.exceptions(std::ifstream::failbit | std::ifstream::badbit);
     f.open(path.c_str(), std::ios::in | std::ios::binary | std::ios::ate);
     return f.tellg() == 0;
+}
+
+static int get_utf8_terminal_width(const std::string & s) {
+    int width = 0;
+    size_t offset = 0;
+    while (offset < s.size()) {
+        utf8_parse_result result = common_parse_utf8_codepoint(s, offset);
+        if (result.status != utf8_parse_result::SUCCESS) {
+            width += 1;
+            offset += 1;
+            continue;
+        }
+        uint32_t cp = result.codepoint;
+        if (cp >= 0x1100 && (
+            (cp <= 0x11FF) || 
+            (cp == 0x2032 || cp == 0x2033) || 
+            (cp >= 0x3000 && cp <= 0x303F) || 
+            (cp >= 0x3040 && cp <= 0x309F) || 
+            (cp >= 0x30A0 && cp <= 0x30FF) || 
+            (cp >= 0x3100 && cp <= 0x312F) || 
+            (cp >= 0x3130 && cp <= 0x318F) || 
+            (cp >= 0x3200 && cp <= 0x32FF) || 
+            (cp >= 0x3300 && cp <= 0x4DBF) || 
+            (cp >= 0x4E00 && cp <= 0x9FFF) || 
+            (cp >= 0xAC00 && cp <= 0xD7A3) || 
+            (cp >= 0xF900 && cp <= 0xFAFF) || 
+            (cp >= 0xFF01 && cp <= 0xFF60) || 
+            (cp >= 0xFFE0 && cp <= 0xFFE6) || 
+            (cp >= 0x20000 && cp <= 0x3FFFF)
+        )) {
+            width += 2;
+        } else {
+            width += 1;
+        }
+        offset += result.bytes_consumed;
+    }
+    return width;
 }
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
@@ -554,6 +592,11 @@ int llama_completion(int argc, char ** argv) {
     std::ostringstream output_ss;     g_output_ss     = &output_ss;
     std::ostringstream assistant_ss; // for storing current assistant message, used in conversation mode
 
+    std::vector<llama_token> sliding_window;
+    for (size_t i = std::max((size_t)0, session_tokens.size() - 3); i < session_tokens.size(); ++i) {
+        sliding_window.push_back(session_tokens[i]);
+    }
+
     // the first thing we will do is to output the prompt, so set color accordingly
     console::set_display(DISPLAY_TYPE_PROMPT);
     display = params.display_prompt;
@@ -687,6 +730,7 @@ int llama_completion(int argc, char ** argv) {
             }
 
             if (!embd.empty()) {
+                const bool generated = (embd.size() == 1 && (int) embd_inp.size() <= n_consumed && !is_interacting);
                 const bool is_last_batch = (n_consumed >= (int) embd_inp.size());
                 const bool save_now = session_do_save && is_last_batch;
                 session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
@@ -704,6 +748,104 @@ int llama_completion(int argc, char ** argv) {
                 if (params.n_print > 0 && n_past % params.n_print == 0) {
                     LOG_DBG("\n\033[31mTokens consumed so far = %d / %d \033[0m\n", n_past, n_ctx);
                 }
+
+                if (generated && sliding_window.size() == 3) {
+                    llama_token token_a = sliding_window[0];
+                    llama_token token_b = sliding_window[1];
+                    llama_token token_c = sliding_window[2];
+
+                    if (!params.sampling.cjk_punct_cache.empty() && !params.sampling.is_pure_space_cache.empty()) {
+                        if (token_a >= 0 && token_a < (llama_token)params.sampling.cjk_punct_cache.size() && params.sampling.cjk_punct_cache[token_a] &&
+                            token_b >= 0 && token_b < (llama_token)params.sampling.is_pure_space_cache.size() && params.sampling.is_pure_space_cache[token_b] &&
+                            token_c >= 0 && token_c < (llama_token)params.sampling.cjk_punct_cache.size() && params.sampling.cjk_punct_cache[token_c]) {
+
+                            llama_token rescued_cjk_token = token_c;
+
+                            // Erase Token B (Space) and Token C from KV Cache
+                            llama_memory_seq_rm(mem, 0, n_past - 2, -1);
+                            n_past -= 2;
+
+                            // Reconstruct the batch with the rescued token
+                            llama_batch batch = llama_batch_init(1, 0, 1);
+                            batch.token[0] = rescued_cjk_token;
+                            batch.pos[0] = n_past;
+                            batch.n_seq_id[0] = 1;
+                            batch.seq_id[0][0] = 0;
+                            batch.logits[0] = true;
+                            batch.n_tokens = 1;
+
+                            if (llama_decode(ctx, batch)) {
+                                LOG_ERR("Failed to decode during speculative rollback\n");
+                                llama_batch_free(batch);
+                                return 1;
+                            }
+                            llama_batch_free(batch);
+                            n_past += 1;
+
+                            // Update session tokens: remove token B and token C, add token C (rescued)
+                            if (session_tokens.size() >= 2) {
+                                session_tokens.pop_back(); // Remove token C
+                                session_tokens.pop_back(); // Remove token B
+                                session_tokens.push_back(rescued_cjk_token);
+                            }
+                            n_session_consumed -= 1;
+
+                            // Update local output buffers: output_tokens contains token C and token B.
+                            // We pop both and push rescued token C.
+                            if (output_tokens.size() >= 2) {
+                                output_tokens.pop_back(); // Remove token C
+                                output_tokens.pop_back(); // Remove token B
+                                output_tokens.push_back(rescued_cjk_token);
+                            }
+
+                            std::string space_str = common_token_to_piece(ctx, token_b, params.special);
+                            std::string rescued_cjk_str = common_token_to_piece(ctx, rescued_cjk_token, params.special);
+
+                            std::string current_output = output_ss.str();
+                            if (current_output.length() >= (space_str.length() + rescued_cjk_str.length())) {
+                                current_output.resize(current_output.length() - (space_str.length() + rescued_cjk_str.length()));
+                                current_output += rescued_cjk_str;
+                                output_ss.str("");
+                                output_ss.clear();
+                                output_ss << current_output;
+                            }
+
+                            if (params.conversation_mode) {
+                                std::string assistant_str = assistant_ss.str();
+                                std::string space_piece = common_token_to_piece(ctx, token_b, false);
+                                std::string rescued_cjk_piece = common_token_to_piece(ctx, rescued_cjk_token, false);
+                                if (assistant_str.length() >= (space_piece.length() + rescued_cjk_piece.length())) {
+                                    assistant_str.resize(assistant_str.length() - (space_piece.length() + rescued_cjk_piece.length()));
+                                    assistant_str += rescued_cjk_piece;
+                                    assistant_ss.str("");
+                                    assistant_ss.clear();
+                                    assistant_ss << assistant_str;
+                                }
+                            }
+
+                            // Erase Space and CJK from terminal using UTF-8 terminal column widths, and print rescued CJK
+                            int cjk_width = get_utf8_terminal_width(rescued_cjk_str);
+                            int space_width = get_utf8_terminal_width(space_str);
+                            for (int i = 0; i < cjk_width; ++i) {
+                                LOG("\b \b");
+                            }
+                            for (int i = 0; i < space_width; ++i) {
+                                LOG("\b \b");
+                            }
+                            LOG("%s", rescued_cjk_str.c_str());
+                            fflush(stdout);
+
+                            // Rollback sampler history
+                            common_sampler_pop(smpl, 2);
+                            common_sampler_accept(smpl, rescued_cjk_token, true);
+
+                            // Update sliding window
+                            sliding_window.pop_back(); // Remove token C
+                            sliding_window.pop_back(); // Remove token B
+                            sliding_window.push_back(rescued_cjk_token);
+                        }
+                    }
+                }
             }
         }
 
@@ -714,6 +856,11 @@ int llama_completion(int argc, char ** argv) {
             const llama_token id = common_sampler_sample(smpl, ctx, -1);
 
             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
+
+            sliding_window.push_back(id);
+            if (sliding_window.size() > 3) {
+                sliding_window.erase(sliding_window.begin());
+            }
 
             // LOG_DBG("last: %s\n", string_from(ctx, smpl->prev.to_vector()).c_str());
 
@@ -739,6 +886,11 @@ int llama_completion(int argc, char ** argv) {
                 // push the prompt in the sampling context in order to apply repetition penalties later
                 // for the prompt, we don't apply grammar rules
                 common_sampler_accept(smpl, embd_inp[n_consumed], /* accept_grammar= */ false);
+
+                sliding_window.push_back(embd_inp[n_consumed]);
+                if (sliding_window.size() > 3) {
+                    sliding_window.erase(sliding_window.begin());
+                }
 
                 ++n_consumed;
                 if ((int) embd.size() == params.n_batch) {

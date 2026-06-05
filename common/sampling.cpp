@@ -70,6 +70,14 @@ struct ring_buffer {
         return value;
     }
 
+    void pop_back() {
+        if (sz == 0) {
+            throw std::runtime_error("ring buffer is empty");
+        }
+        pos = (pos + capacity - 1) % capacity;
+        sz--;
+    }
+
     const T & rat(size_t i) const {
         if (i >= sz) {
             throw std::runtime_error("ring buffer: index out of bounds");
@@ -468,6 +476,18 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     gsmpl->prev.push_back(token);
 }
 
+void common_sampler_pop(struct common_sampler * gsmpl, size_t n) {
+    if (!gsmpl) {
+        return;
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        if (!gsmpl->prev.empty()) {
+            gsmpl->prev.pop_back();
+        }
+    }
+}
+
 void common_sampler_reset(struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return;
@@ -630,16 +650,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     if (!gsmpl->params.cjk_strip_map.empty() && !gsmpl->prev.empty()) {
         llama_token last_token = gsmpl->prev.rat(0);
         if (last_token >= 0 && last_token < (llama_token)gsmpl->params.cjk_punct_cache.size() && gsmpl->params.cjk_punct_cache[last_token]) {
-            // O(1) Space Rejection
-            while (id >= 0 && id < (llama_token)gsmpl->params.is_pure_space_cache.size() && gsmpl->params.is_pure_space_cache[id]) {
-                gsmpl->cur_p.data[gsmpl->cur_p.selected].logit = -INFINITY;
-                llama_sampler_apply(gsmpl->chain, &gsmpl->cur_p);
-                if (gsmpl->cur_p.selected == -1 || gsmpl->cur_p.data[gsmpl->cur_p.selected].logit == -INFINITY) {
-                    break;
-                }
-                id = gsmpl->cur_p.data[gsmpl->cur_p.selected].id;
-            }
-
             if (id >= 0 && id < (llama_token)gsmpl->params.cjk_strip_map.size() && !gsmpl->params.cjk_strip_map[id].empty()) {
                 const auto & mapped_tokens = gsmpl->params.cjk_strip_map[id];
                 for (size_t i = 1; i < mapped_tokens.size(); ++i) {
