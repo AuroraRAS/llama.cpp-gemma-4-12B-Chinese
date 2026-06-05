@@ -148,8 +148,9 @@ int main(int argc, char ** argv) {
     int32_t n_vocab = llama_vocab_n_tokens(vocab);
     printf("Successfully loaded vocabulary with %d tokens.\n", n_vocab);
 
-    std::vector<llama_token> strip_map(n_vocab, -1);
+    std::vector<std::vector<llama_token>> strip_map(n_vocab);
     std::vector<uint8_t> is_cjk_punct_cache(n_vocab, 0);
+    std::vector<uint8_t> is_pure_space_cache(n_vocab, 0);
     int32_t mapped_count = 0;
     int32_t cjk_punct_count = 0;
 
@@ -159,6 +160,10 @@ int main(int argc, char ** argv) {
         if (is_cjk_or_punctuation(piece)) {
             is_cjk_punct_cache[id] = 1;
             cjk_punct_count++;
+        }
+
+        if (piece == " " || piece == "\xe2\x96\x81" || piece == "\xc4\xa0" || piece == "\xc5\xa0") {
+            is_pure_space_cache[id] = 1;
         }
 
         // Bypass special tokens for the mapping
@@ -172,17 +177,20 @@ int main(int argc, char ** argv) {
             if (is_cjk_or_punctuation(pure_str)) {
                 // Tokenize the stripped string
                 auto pure_tokens = common_tokenize(vocab, pure_str, false, false);
-                if (pure_tokens.size() == 1) {
-                    std::string verify_str = common_token_to_piece(vocab, pure_tokens[0], true);
+                if (!pure_tokens.empty()) {
+                    std::string verify_str = "";
+                    for (llama_token t : pure_tokens) {
+                        verify_str += common_token_to_piece(vocab, t, true);
+                    }
                     if (verify_str == pure_str) {
-                        strip_map[id] = pure_tokens[0];
+                        strip_map[id] = pure_tokens;
                         mapped_count++;
                         // Print mapping log
-                        printf("Mapped: %6d ('%s') -> %6d ('%s')\n", id, piece.c_str(), pure_tokens[0], pure_str.c_str());
+                        printf("Mapped: %6d ('%s') -> %zu tokens ('%s')\n", id, piece.c_str(), pure_tokens.size(), pure_str.c_str());
                     } else {
                         // Semantic collision detected
-                        printf("Collision warning: ID %d ('%s') stripped to '%s', re-tokenized to ID %d ('%s') [REJECTED]\n",
-                               id, piece.c_str(), pure_str.c_str(), pure_tokens[0], verify_str.c_str());
+                        printf("Collision warning: ID %d ('%s') stripped to '%s', re-tokenized to %zu tokens starting with ID %d ('%s') [REJECTED]\n",
+                               id, piece.c_str(), pure_str.c_str(), pure_tokens.size(), pure_tokens[0], verify_str.c_str());
                     }
                 }
             }
@@ -214,15 +222,6 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // Payload: strip_map
-    if (fwrite(strip_map.data(), sizeof(llama_token), n_vocab, f) != (size_t)n_vocab) {
-        fprintf(stderr, "error: failed to write mapping payload to '%s'\n", output_path.c_str());
-        fclose(f);
-        llama_model_free(model);
-        llama_backend_free();
-        return 1;
-    }
-
     // Payload: is_cjk_punct_cache
     if (fwrite(is_cjk_punct_cache.data(), sizeof(uint8_t), n_vocab, f) != (size_t)n_vocab) {
         fprintf(stderr, "error: failed to write punct cache payload to '%s'\n", output_path.c_str());
@@ -232,9 +231,38 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Payload: is_pure_space_cache
+    if (fwrite(is_pure_space_cache.data(), sizeof(uint8_t), n_vocab, f) != (size_t)n_vocab) {
+        fprintf(stderr, "error: failed to write pure space cache payload to '%s'\n", output_path.c_str());
+        fclose(f);
+        llama_model_free(model);
+        llama_backend_free();
+        return 1;
+    }
+
+    // Payload: strip_map (1-to-N mappings)
+    for (int32_t id = 0; id < n_vocab; ++id) {
+        uint8_t count = (uint8_t)strip_map[id].size();
+        if (fwrite(&count, sizeof(count), 1, f) != 1) {
+            fprintf(stderr, "error: failed to write mapping count for token %d to '%s'\n", id, output_path.c_str());
+            fclose(f);
+            llama_model_free(model);
+            llama_backend_free();
+            return 1;
+        }
+        if (count > 0) {
+            if (fwrite(strip_map[id].data(), sizeof(llama_token), count, f) != count) {
+                fprintf(stderr, "error: failed to write mapping tokens for token %d to '%s'\n", id, output_path.c_str());
+                fclose(f);
+                llama_model_free(model);
+                llama_backend_free();
+                return 1;
+            }
+        }
+    }
+
     fclose(f);
-    printf("Successfully wrote strip map binary (%zu bytes total).\n",
-           sizeof(magic) + sizeof(size) + n_vocab * sizeof(llama_token) + n_vocab * sizeof(uint8_t));
+    printf("Successfully wrote strip map binary.\n");
 
     // Test common_params_sampling initialization with the generated binary file
     printf("Testing sampler initialization with the generated binary map...\n");
@@ -251,10 +279,22 @@ int main(int argc, char ** argv) {
         test_f.read(reinterpret_cast<char*>(&magic_val), sizeof(magic_val));
         uint32_t size_val;
         test_f.read(reinterpret_cast<char*>(&size_val), sizeof(size_val));
-        sparams.cjk_strip_map.resize(size_val);
-        test_f.read(reinterpret_cast<char*>(sparams.cjk_strip_map.data()), size_val * sizeof(llama_token));
+        
         sparams.cjk_punct_cache.resize(size_val);
         test_f.read(reinterpret_cast<char*>(sparams.cjk_punct_cache.data()), size_val * sizeof(uint8_t));
+
+        sparams.is_pure_space_cache.resize(size_val);
+        test_f.read(reinterpret_cast<char*>(sparams.is_pure_space_cache.data()), size_val * sizeof(uint8_t));
+
+        sparams.cjk_strip_map.resize(size_val);
+        for (uint32_t id = 0; id < size_val; ++id) {
+            uint8_t count = 0;
+            test_f.read(reinterpret_cast<char*>(&count), sizeof(count));
+            if (count > 0) {
+                sparams.cjk_strip_map[id].resize(count);
+                test_f.read(reinterpret_cast<char*>(sparams.cjk_strip_map[id].data()), count * sizeof(llama_token));
+            }
+        }
     }
 
     // Try initializing a common_sampler

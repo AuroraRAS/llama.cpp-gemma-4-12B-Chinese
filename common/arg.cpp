@@ -1942,15 +1942,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             if (!file) {
                 throw std::runtime_error("error: failed to read CJK strip map vocab size");
             }
-            params.sampling.cjk_strip_map.resize(n_vocab);
-            file.read(reinterpret_cast<char*>(params.sampling.cjk_strip_map.data()), n_vocab * sizeof(llama_token));
-            if (!file) {
-                throw std::runtime_error("error: failed to read CJK strip map content");
-            }
             params.sampling.cjk_punct_cache.resize(n_vocab);
             file.read(reinterpret_cast<char*>(params.sampling.cjk_punct_cache.data()), n_vocab * sizeof(uint8_t));
             if (!file) {
                 throw std::runtime_error("error: failed to read CJK punct cache content");
+            }
+            params.sampling.is_pure_space_cache.resize(n_vocab);
+            file.read(reinterpret_cast<char*>(params.sampling.is_pure_space_cache.data()), n_vocab * sizeof(uint8_t));
+            if (!file) {
+                throw std::runtime_error("error: failed to read CJK pure space cache content");
+            }
+            params.sampling.cjk_strip_map.resize(n_vocab);
+            for (uint32_t id = 0; id < n_vocab; ++id) {
+                uint8_t count = 0;
+                file.read(reinterpret_cast<char*>(&count), sizeof(count));
+                if (!file) {
+                    throw std::runtime_error("error: failed to read mapping count for token " + std::to_string(id));
+                }
+                if (count > 0) {
+                    params.sampling.cjk_strip_map[id].resize(count);
+                    file.read(reinterpret_cast<char*>(params.sampling.cjk_strip_map[id].data()), count * sizeof(llama_token));
+                    if (!file) {
+                        throw std::runtime_error("error: failed to read mapping tokens for token " + std::to_string(id));
+                    }
+                }
             }
         }
     ).set_sampling());

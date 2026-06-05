@@ -191,6 +191,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
     if (!params.cjk_strip_map.empty()) {
         GGML_ASSERT(params.cjk_strip_map.size() == (size_t)llama_vocab_n_tokens(vocab) && "cjk_strip_map size does not match vocab size");
         GGML_ASSERT(params.cjk_punct_cache.size() == (size_t)llama_vocab_n_tokens(vocab) && "cjk_punct_cache size does not match vocab size");
+        GGML_ASSERT(params.is_pure_space_cache.size() == (size_t)llama_vocab_n_tokens(vocab) && "is_pure_space_cache size does not match vocab size");
     }
 
     llama_sampler_chain_params lparams = llama_sampler_chain_default_params();
@@ -541,6 +542,12 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+    if (!gsmpl->params.injected_tokens_queue.empty()) {
+        llama_token injected_id = gsmpl->params.injected_tokens_queue.front();
+        gsmpl->params.injected_tokens_queue.pop_front();
+        return injected_id;
+    }
+
     llama_synchronize(ctx);
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
@@ -623,8 +630,22 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     if (!gsmpl->params.cjk_strip_map.empty() && !gsmpl->prev.empty()) {
         llama_token last_token = gsmpl->prev.rat(0);
         if (last_token >= 0 && last_token < (llama_token)gsmpl->params.cjk_punct_cache.size() && gsmpl->params.cjk_punct_cache[last_token]) {
-            if (id >= 0 && id < (llama_token)gsmpl->params.cjk_strip_map.size() && gsmpl->params.cjk_strip_map[id] != -1) {
-                id = gsmpl->params.cjk_strip_map[id];
+            // O(1) Space Rejection
+            while (id >= 0 && id < (llama_token)gsmpl->params.is_pure_space_cache.size() && gsmpl->params.is_pure_space_cache[id]) {
+                gsmpl->cur_p.data[gsmpl->cur_p.selected].logit = -INFINITY;
+                llama_sampler_apply(gsmpl->chain, &gsmpl->cur_p);
+                if (gsmpl->cur_p.selected == -1 || gsmpl->cur_p.data[gsmpl->cur_p.selected].logit == -INFINITY) {
+                    break;
+                }
+                id = gsmpl->cur_p.data[gsmpl->cur_p.selected].id;
+            }
+
+            if (id >= 0 && id < (llama_token)gsmpl->params.cjk_strip_map.size() && !gsmpl->params.cjk_strip_map[id].empty()) {
+                const auto & mapped_tokens = gsmpl->params.cjk_strip_map[id];
+                for (size_t i = 1; i < mapped_tokens.size(); ++i) {
+                    gsmpl->params.injected_tokens_queue.push_back(mapped_tokens[i]);
+                }
+                id = mapped_tokens[0];
             }
         }
     }

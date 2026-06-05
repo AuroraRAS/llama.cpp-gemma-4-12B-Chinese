@@ -14,6 +14,7 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <deque>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0A00
@@ -281,8 +282,10 @@ struct common_params_sampling {
 
     bool backend_sampling = false;
 
-    std::vector<llama_token> cjk_strip_map;
-    std::vector<uint8_t>     cjk_punct_cache;
+    std::vector<uint8_t> cjk_punct_cache;
+    std::vector<uint8_t> is_pure_space_cache;
+    std::vector<std::vector<llama_token>> cjk_strip_map;
+    std::deque<llama_token> injected_tokens_queue; // The hijacking queue
 
     bool has_logit_bias() const {
         return !logit_bias.empty();
