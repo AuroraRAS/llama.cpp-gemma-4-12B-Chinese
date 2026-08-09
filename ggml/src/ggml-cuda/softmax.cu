@@ -51,7 +51,7 @@ struct soft_max_params {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template <bool use_shared, int ncols_template, int block_size_template, typename T>
+template <bool use_shared, bool reuse_reduction_scratch, int ncols_template, int block_size_template, typename T>
 static __global__ void soft_max_f32(
         const float * x, const T * mask, const float * sinks, float * dst, const soft_max_params p) {
     const int ncols = ncols_template == 0 ? p.ncols : ncols_template;
@@ -80,7 +80,8 @@ static __global__ void soft_max_f32(
     extern __shared__ float data_soft_max_f32[];
     float * buf_iw = data_soft_max_f32; // shared memory buffer for inter-warp communication
     // shared memory buffer to cache values between iterations:
-    float * vals = use_shared ? buf_iw + WARP_SIZE : dst;
+    float * vals = use_shared ? buf_iw + (reuse_reduction_scratch ? 0 : WARP_SIZE) : dst;
+    float reduction_scratch = 0.0f;
 
     float max_val = sinks ? sinks[i02] : -INFINITY;
 
@@ -98,8 +99,23 @@ static __global__ void soft_max_f32(
         max_val = max(max_val, val);
     }
 
+    if constexpr (reuse_reduction_scratch) {
+        if (tid < WARP_SIZE) {
+            reduction_scratch = vals[tid];
+        }
+        __syncthreads();
+    }
+
     // find the max value in the block
     max_val = block_reduce<block_reduce_method::MAX, block_size_template>(max_val, buf_iw);
+
+    if constexpr (reuse_reduction_scratch) {
+        __syncthreads();
+        if (tid < WARP_SIZE) {
+            vals[tid] = reduction_scratch;
+        }
+        __syncthreads();
+    }
 
     float tmp = 0.0f; // partial sum
 
@@ -116,8 +132,23 @@ static __global__ void soft_max_f32(
         vals[col] = val;
     }
 
+    if constexpr (reuse_reduction_scratch) {
+        if (tid < WARP_SIZE) {
+            reduction_scratch = vals[tid];
+        }
+        __syncthreads();
+    }
+
     // find the sum of exps in the block
     tmp = block_reduce<block_reduce_method::SUM, block_size_template>(tmp, buf_iw);
+
+    if constexpr (reuse_reduction_scratch) {
+        __syncthreads();
+        if (tid < WARP_SIZE) {
+            vals[tid] = reduction_scratch;
+        }
+        __syncthreads();
+    }
 
     if (sinks) {
         tmp += expf(sinks[i02] - max_val);
@@ -269,7 +300,7 @@ static __global__ void soft_max_back_f32(
     }
 }
 
-template<int... Ns, typename T>
+template<bool reuse_reduction_scratch, int... Ns, typename T>
 static void launch_soft_max_kernels(const float * x, const T * mask, const float * sinks, float * dst,
                              const soft_max_params & p, cudaStream_t stream, dim3 block_dims, dim3 block_nums, size_t nbytes_shared)
 {
@@ -281,8 +312,8 @@ static void launch_soft_max_kernels(const float * x, const T * mask, const float
         constexpr int block = (ncols > 1024 ? 1024 : ncols);
 
         if (p.ncols == ncols) {
-            CUDA_SET_SHARED_MEMORY_LIMIT((soft_max_f32<true, ncols, block, T>), smpbo);
-            soft_max_f32<true, ncols, block><<<block_nums, block_dims, nbytes_shared, stream>>>
+            CUDA_SET_SHARED_MEMORY_LIMIT((soft_max_f32<true, reuse_reduction_scratch, ncols, block, T>), smpbo);
+            soft_max_f32<true, reuse_reduction_scratch, ncols, block><<<block_nums, block_dims, nbytes_shared, stream>>>
                 (x, mask, sinks, dst, p);
             return true;
         }
@@ -295,8 +326,8 @@ static void launch_soft_max_kernels(const float * x, const T * mask, const float
     }
 
     //default case
-    CUDA_SET_SHARED_MEMORY_LIMIT((soft_max_f32<true, 0, 0, T>), smpbo);
-    soft_max_f32<true, 0, 0><<<block_nums, block_dims, nbytes_shared, stream>>>(x, mask, sinks, dst, p);
+    CUDA_SET_SHARED_MEMORY_LIMIT((soft_max_f32<true, reuse_reduction_scratch, 0, 0, T>), smpbo);
+    soft_max_f32<true, reuse_reduction_scratch, 0, 0><<<block_nums, block_dims, nbytes_shared, stream>>>(x, mask, sinks, dst, p);
 }
 
 __launch_bounds__(8*WARP_SIZE, 1) static __global__ void soft_max_f32_parallelize_cols(const float * __restrict__ x,
@@ -336,10 +367,14 @@ static void soft_max_f32_cuda(const float *                                x,
 
     const int id       = ggml_cuda_get_device();
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+    const bool use_shared_overlap = ggml_cuda_info().devices[id].cc == GGML_CUDA_CC_GFX90C && ncols_x == 16384 &&
+                                    nbytes_shared == smpbo + WARP_SIZE * sizeof(float);
 
 
     if (nbytes_shared <= smpbo) {
-        launch_soft_max_kernels<32, 64, 128, 256, 512, 1024, 2048, 4096>(x, mask, sinks, dst, params, stream, block_dims, block_nums, nbytes_shared);
+        launch_soft_max_kernels<false, 32, 64, 128, 256, 512, 1024, 2048, 4096>(x, mask, sinks, dst, params, stream, block_dims, block_nums, nbytes_shared);
+    } else if (use_shared_overlap) {
+        launch_soft_max_kernels<true, 32, 64, 128, 256, 512, 1024, 2048, 4096>(x, mask, sinks, dst, params, stream, block_dims, block_nums, smpbo);
     } else {
         // Parallelize across SMs for top-p/dist-sampling
         // The heuristic for parallelizing rows across SMs vs parallelizing single row & looping over all rows was done on the basis of a B6000 GPU and
@@ -357,7 +392,7 @@ static void soft_max_f32_cuda(const float *                                x,
                                                    dim3(WARP_SIZE * 8, 1, 1), kernel_args, 0, stream));
         } else {
             const size_t nbytes_shared_low = WARP_SIZE * sizeof(float);
-            soft_max_f32<false, 0, 0>
+            soft_max_f32<false, false, 0, 0>
                 <<<block_nums, block_dims, nbytes_shared_low, stream>>>(x, mask, sinks, dst, params);
         }
     }
